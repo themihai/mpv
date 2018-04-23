@@ -13,10 +13,10 @@ import (
 
 // Response received from mpv. Can be an event or a user requested response.
 type Response struct {
-	Err       string      `json:"error"`
-	Data      interface{} `json:"data"` // May contain float64, bool or string
-	Event     string      `json:"event"`
-	RequestID int         `json:"request_id"`
+	Err       string          `json:"error"`
+	Data      json.RawMessage `json:"data"` // May contain float64, bool or string
+	Event     string          `json:"event"`
+	RequestID int             `json:"request_id"`
 }
 
 // request sent to mpv. Includes request_id for mapping the response.
@@ -50,15 +50,15 @@ type IPCClient struct {
 }
 
 // NewIPCClient creates a new IPCClient connected to the given socket.
-func NewIPCClient(socket string) *IPCClient {
+func NewIPCClient(socket string) (*IPCClient, error) {
 	c := &IPCClient{
 		socket:  socket,
 		timeout: 2 * time.Second,
 		comm:    make(chan *request),
 		reqMap:  make(map[int]*request),
 	}
-	c.run()
-	return c
+	err := c.run()
+	return c, err
 }
 
 // dispatch dispatches responses to the corresponding request
@@ -77,21 +77,26 @@ func (c *IPCClient) dispatch(resp *Response) {
 	}
 }
 
-func (c *IPCClient) run() {
+func (c *IPCClient) run() error {
 	conn, err := net.Dial("unix", c.socket)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	go c.readloop(conn)
-	go c.writeloop(conn)
+	go func() {
+		if err := c.writeloop(conn); err != nil {
+			panic(err)
+		}
+	}()
 	// TODO: Close connection
+	return nil
 }
 
-func (c *IPCClient) writeloop(conn io.Writer) {
+func (c *IPCClient) writeloop(conn io.Writer) error {
 	for {
 		req, ok := <-c.comm
 		if !ok {
-			panic("Communication channel closed")
+			return errors.New("Communication channel closed")
 		}
 		b, err := json.Marshal(req)
 		if err != nil {
@@ -135,6 +140,9 @@ var (
 	ErrTimeoutRecv = errors.New("Timeout while receiving response")
 )
 
+// The client should be restarted
+var ChannelErr = errors.New("Response channel closed")
+
 // Exec executes a command via ipc and returns the response.
 // A request can timeout while sending or while waiting for the response.
 // An error is only returned if there was an error in the communication.
@@ -151,7 +159,7 @@ func (c *IPCClient) Exec(command ...interface{}) (*Response, error) {
 	select {
 	case res, ok := <-req.Response:
 		if !ok {
-			panic("Response channel closed")
+			return nil, ChannelErr
 		}
 		return res, nil
 	case <-time.After(c.timeout):

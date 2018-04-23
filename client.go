@@ -1,8 +1,10 @@
 package mpv
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	//log "github.com/golang/glog"
 	"strconv"
 )
 
@@ -32,6 +34,136 @@ const (
 func (c *Client) Loadfile(path string, mode string) error {
 	_, err := c.Exec("loadfile", path, mode)
 	return err
+}
+
+type SubFlag string
+
+const (
+	// Select the subtitle immediately.
+	Select SubFlag = "select"
+	// Don't select the subtitle.
+	// (Or in some special situations,
+	// let the default stream selection mechanism decide.)
+	Auto SubFlag = "auto"
+	// Select the subtitle. If a subtitle with the same filename was
+	// already added, that one is selected, instead of loading a
+	// duplicate entry. (In this case, title/language are ignored,
+	// and if the was changed since it was loaded, these
+	// changes won't be reflected.)
+	Cached SubFlag = "cached"
+	// The title argument sets the track title in the UI.
+	Title SubFlag = "title"
+	// The lang argument sets the track language, and
+	// can also influence stream selection with flags set
+	// to auto.
+	Lang SubFlag = "lang"
+)
+
+// Load the given subtitle file. It is selected as current subtitle after loading.
+// The flags args is one of the following values:
+func (c *Client) SubAdd(file string, flags ...SubFlag) error {
+	var argv []interface{}
+	argv = append(argv, "sub-add")
+	argv = append(argv, file)
+	for _, v := range flags {
+		argv = append(argv, string(v))
+	}
+	res, err := c.Exec(argv...)
+	if res == nil {
+		return err
+	}
+	return err
+}
+
+// Remove the given subtitle track. If the id argument is missing,
+// remove the current track. (Works on external subtitle files only.)
+func (c *Client) SubRemove(id string) error {
+	res, err := c.Exec("sub-remove", id)
+	if res == nil {
+		return err
+	}
+	return err
+}
+
+// Display OSD menu
+func (c *Client) SetOSD(ok bool) error {
+	var err error
+	var res *Response
+	if ok {
+		res, err = c.Exec("osc")
+	} else {
+		res, err = c.Exec("no-osc")
+	}
+	if res == nil {
+		return err
+	}
+	return err
+}
+
+type VideoTrack struct {
+	DemuxW   int     `json:"demux-w"`
+	DemuxH   int     `json:"demux-h"`
+	DemuxFPS float64 `json:"demux-fps"`
+}
+
+type AudioTrack struct {
+	Channels      int    `json:"audio-channels"`
+	ChannelCount  int    `json:"demux-channel-count"`
+	DemuxChannels string `json:"demux-channels"`
+	SampleRate    int    `json:"demux-samplerate"`
+}
+
+type Track struct {
+	ID          int    `json:"id"`   // unique wihtin Type
+	Type        string `json:"type"` // e.g. audio , video, sub
+	SrcID       int    `json:"src-id"`
+	Title       string `json:"title"`
+	Lang        string `json:"lang"`
+	Albumart    bool   `json:"albumart"`
+	Default     bool   `json:"default"`
+	Forced      bool   `json:"forced"`
+	External    bool   `json:"external"`
+	Selected    bool   `json:"selected"`
+	FFIndex     int    `json:"ff-index"`
+	DecoderDesc string `json:"decoder-desc"`
+	Codec       string `json:"codec"`
+	Filename    string `json:"external-filename"`
+
+	AudioTrack
+	VideoTrack
+}
+
+// List of audio/video/sub tracks, current entry marked.
+// Currently, the raw property value is useless.
+// This has a number of sub-properties.
+func (c *Client) TrackList() ([]Track, error) {
+	res, err := c.Exec("get_property", "track-list")
+	if res == nil {
+		return nil, err
+	}
+	//log.Errorf("Data %s", string(res.Data))
+	var ta []Track
+	if err = json.Unmarshal([]byte(res.Data), &ta); err != nil {
+		return nil, fmt.Errorf("data %s, err %v", res.Data, err)
+	}
+	return ta, nil
+}
+
+// While playback is active, you can set existing tracks only.
+// (The option allows setting any track ID,
+// and which tracks to enable is chosen at loading time.)
+func (c *Client) SetAudioTrack(ID int) error {
+	return c.SetProperty("aid", ID)
+}
+
+func (c *Client) SetVideoTrack(ID int) error {
+	return c.SetProperty("vid", ID)
+}
+
+// subtitle track
+func (c *Client) SetTextTrack(ID int) error {
+	//vid, aid, sid
+	return c.SetProperty("sid", ID)
 }
 
 // Mode options for Seek
@@ -97,8 +229,9 @@ func (c *Client) GetFloatProperty(name string) (float64, error) {
 	if res == nil {
 		return 0, err
 	}
-	if val, found := res.Data.(float64); found {
-		return val, err
+	v, err := strconv.ParseFloat(string(res.Data), 64)
+	if err == nil {
+		return v, nil
 	}
 	return 0, ErrInvalidType
 }
@@ -109,8 +242,9 @@ func (c *Client) GetBoolProperty(name string) (bool, error) {
 	if res == nil {
 		return false, err
 	}
-	if val, found := res.Data.(bool); found {
-		return val, err
+	v, err := strconv.ParseBool(string(res.Data))
+	if err == nil {
+		return v, nil
 	}
 	return false, ErrInvalidType
 }
@@ -130,6 +264,15 @@ func (c *Client) Pause() (bool, error) {
 	return c.GetBoolProperty("pause")
 }
 
+// property - e.g. pause
+func (c *Client) Cycle(property string) error {
+	res, err := c.Exec("cycle", property)
+	if res == nil {
+		return err
+	}
+	return err
+}
+
 // SetPause pauses or unpauses the player
 func (c *Client) SetPause(pause bool) error {
 	return c.SetProperty("pause", pause)
@@ -138,6 +281,10 @@ func (c *Client) SetPause(pause bool) error {
 // Idle returns true if the player is idle
 func (c *Client) Idle() (bool, error) {
 	return c.GetBoolProperty("idle")
+}
+
+func (c *Client) PlaybackTime() (float64, error) {
+	return c.GetFloatProperty("playback-time")
 }
 
 // Mute returns true if the player is muted.
@@ -165,6 +312,20 @@ func (c *Client) Volume() (float64, error) {
 	return c.GetFloatProperty("volume")
 }
 
+// 1 increases the volume by 1 , -1 decreases the volume by 1
+func (c *Client) SetVolumeGain(i int) error {
+	v, err := c.GetFloatProperty("volume")
+	if err != nil {
+		return err
+	}
+	v = v + float64(i)
+	return c.SetProperty("volume", v)
+}
+
+func (c *Client) SetVolume(i int) error {
+	return c.SetProperty("volume", i)
+}
+
 // Speed returns the current playback speed.
 func (c *Client) Speed() (float64, error) {
 	return c.GetFloatProperty("speed")
@@ -177,10 +338,36 @@ func (c *Client) Duration() (float64, error) {
 
 // Position returns the current playback position in seconds.
 func (c *Client) Position() (float64, error) {
-	return c.GetFloatProperty("time-pos")
+	s, err := c.GetFloatProperty("time-pos")
+	if err != nil {
+		return 0, err
+	}
+	return s, err
 }
 
 // PercentPosition returns the current playback position in percent.
 func (c *Client) PercentPosition() (float64, error) {
 	return c.GetFloatProperty("percent-pos")
+}
+
+// Stop playback and clear playlist.
+// With default settings, this is essentially like quit.
+// Useful for the client API: playback can be stopped without
+// terminating the player.
+func (c *Client) Stop() error {
+	res, err := c.Exec("stop")
+	if res == nil {
+		return err
+	}
+	return err
+}
+
+// Exit the player. If an argument is given,
+// it's used as process exit code.
+func (c *Client) Quit(code int) error {
+	res, err := c.Exec("quit", code)
+	if res == nil {
+		return err
+	}
+	return err
 }
