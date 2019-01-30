@@ -2,9 +2,12 @@ package mpv
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"sync"
@@ -37,10 +40,14 @@ func newRequest(cmd ...interface{}) *request {
 // LLClient is the most low level interface
 type LLClient interface {
 	Exec(command ...interface{}) (*Response, error)
+	Close() error
 }
 
 // IPCClient is a low-level IPC client to communicate with the mpv player via socket.
 type IPCClient struct {
+	cx      context.Context
+	conn    net.Conn
+	cancel  context.CancelFunc
 	socket  string
 	timeout time.Duration
 	comm    chan *request
@@ -50,58 +57,89 @@ type IPCClient struct {
 }
 
 // NewIPCClient creates a new IPCClient connected to the given socket.
-func NewIPCClient(socket string) (*IPCClient, error) {
+func NewIPCClient(cx context.Context, socket string) (*IPCClient, error) {
+	ctx, cancel := context.WithCancel(cx)
 	c := &IPCClient{
+		cx:      ctx,
+		cancel:  cancel,
 		socket:  socket,
 		timeout: 2 * time.Second,
 		comm:    make(chan *request),
 		reqMap:  make(map[int]*request),
 	}
-	err := c.run()
+	err := c.run(ctx)
 	return c, err
 }
 
 // dispatch dispatches responses to the corresponding request
-func (c *IPCClient) dispatch(resp *Response) {
+func (c *IPCClient) dispatch(cx context.Context, resp *Response) {
 	if resp.Event == "" { // No Event
 		c.mu.Lock()
-		defer c.mu.Unlock()
-		if req, ok := c.reqMap[resp.RequestID]; ok { // Lookup requestID in request map
+		// Lookup requestID in request map
+		if req, ok := c.reqMap[resp.RequestID]; ok {
 			delete(c.reqMap, resp.RequestID)
-			req.Response <- resp
+			c.mu.Unlock()
+			select {
+			case req.Response <- resp:
+			case <-cx.Done():
+			}
 			return
 		}
+		c.mu.Unlock()
 		// Discard response
 	} else { // Event
 		// TODO: Implement Event support
 	}
+
 }
 
-func (c *IPCClient) run() error {
-	conn, err := net.Dial("unix", c.socket)
+func (c *IPCClient) run(cx context.Context) error {
+	dl := &net.Dialer{
+		Timeout: c.timeout,
+	}
+	var err error
+	c.conn, err = dl.DialContext(cx, "unix", c.socket)
 	if err != nil {
 		return err
 	}
-	go c.readloop(conn)
+	go c.readloop(cx, c.conn)
 	go func() {
-		if err := c.writeloop(conn); err != nil {
-			panic(err)
+		if err := c.writeloop(cx, c.conn); err != nil {
+			fmt.Printf("%#v", err)
 		}
 	}()
-	// TODO: Close connection
 	return nil
 }
 
-func (c *IPCClient) writeloop(conn io.Writer) error {
+func (c *IPCClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cancel()
+	err := c.conn.Close()
+	return err
+}
+
+func (c *IPCClient) writeloop(cx context.Context, conn io.Writer) error {
 	for {
-		req, ok := <-c.comm
-		if !ok {
-			return errors.New("Communication channel closed")
+		select {
+		default:
+		case <-cx.Done():
+			return cx.Err()
+		}
+		var ok bool
+		var req *request
+		select {
+		case req, ok = <-c.comm:
+			if !ok {
+				return errors.New("Communication channel closed")
+			}
+		case <-cx.Done():
+			return cx.Err()
 		}
 		b, err := json.Marshal(req)
 		if err != nil {
 			// TODO: Discard request, maybe send error downstream
-			// log.Printf("Discard request %v with error: %s", req, err)
+			log.Printf("Discard request %v with error: %s", req, err)
 			continue
 		}
 		c.mu.Lock()
@@ -116,9 +154,14 @@ func (c *IPCClient) writeloop(conn io.Writer) error {
 	}
 }
 
-func (c *IPCClient) readloop(conn io.Reader) {
+func (c *IPCClient) readloop(cx context.Context, conn io.Reader) {
 	rd := bufio.NewReader(conn)
 	for {
+		select {
+		default:
+		case <-cx.Done():
+			return
+		}
 		data, err := rd.ReadBytes('\n')
 		if err != nil {
 			// TODO: Handle error
@@ -130,7 +173,7 @@ func (c *IPCClient) readloop(conn io.Reader) {
 			// TODO: Handle error
 			continue
 		}
-		c.dispatch(&resp)
+		c.dispatch(cx, &resp)
 	}
 }
 
@@ -150,19 +193,28 @@ var ChannelErr = errors.New("Response channel closed")
 // an error.
 func (c *IPCClient) Exec(command ...interface{}) (*Response, error) {
 	req := newRequest(command...)
+	timer := time.NewTimer(c.timeout)
 	select {
+	case <-c.cx.Done():
+		timer.Stop()
+		return nil, c.cx.Err()
 	case c.comm <- req:
-	case <-time.After(c.timeout):
+		timer.Stop()
+	case <-timer.C:
 		return nil, ErrTimeoutSend
 	}
-
+	timer = time.NewTimer(c.timeout)
 	select {
+	case <-c.cx.Done():
+		timer.Stop()
+		return nil, c.cx.Err()
 	case res, ok := <-req.Response:
+		timer.Stop()
 		if !ok {
 			return nil, ChannelErr
 		}
 		return res, nil
-	case <-time.After(c.timeout):
+	case <-timer.C:
 		return nil, ErrTimeoutRecv
 	}
 }
